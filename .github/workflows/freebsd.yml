@@ -10,6 +10,8 @@ on:
       - Cargo.toml
       - Cargo.lock
       - "**/Cargo.toml"
+      - crates/engine/src/demo.rs
+      - crates/engine/src/media.rs
       - .github/workflows/freebsd.yml
   workflow_dispatch:
 
