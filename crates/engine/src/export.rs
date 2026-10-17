@@ -120,14 +120,19 @@ impl Resize {
             ResizeMode::Percent => v / 100.0,
         };
         let k = if self.dont_enlarge { k.min(1.0) } else { k };
-        // at least one pixel, at most the encoders' 65535 limit
-        k.clamp(1.0 / short, 65_535.0 / long)
+        // Prefer at least one pixel on the short edge, then enforce the encoders' long-edge
+        // limit. Above a 65535:1 aspect ratio both bounds cannot hold at once; the encoder
+        // limit wins, and `apply` rounds/clamps the subpixel short edge to one pixel.
+        k.max(1.0 / short).min(65_535.0 / long)
     }
 
     /// Output size for a `w × h` (cropped, full-resolution) photo.
+    ///
+    /// Round to whole pixels and bound each axis to 1..=65535. This can change the aspect
+    /// ratio slightly; ratios above 65535:1 cannot be preserved within those bounds.
     pub fn apply(&self, w: f64, h: f64) -> (usize, usize) {
         let k = self.scale(w, h);
-        (((w * k).round() as usize).max(1), ((h * k).round() as usize).max(1))
+        (((w * k).round() as usize).clamp(1, 65_535), ((h * k).round() as usize).clamp(1, 65_535))
     }
 }
 
@@ -1960,6 +1965,57 @@ mod tests {
         // never larger than the encoders' limit, never empty
         assert_eq!(size(json!({"percent": 10000, "dontEnlarge": false}), 6000.0, 4000.0), Some((65535, 43690)));
         assert_eq!(size(json!({"width": 1}), 6000.0, 40.0).map(|s| s.1), Some(1));
+    }
+
+    #[test]
+    fn resize_extreme_aspect_ratios_stay_within_encoder_limits() {
+        for mode in [
+            ResizeMode::LongEdge,
+            ResizeMode::ShortEdge,
+            ResizeMode::Width,
+            ResizeMode::Height,
+            ResizeMode::Dimensions,
+            ResizeMode::Megapixels,
+            ResizeMode::Percent,
+        ] {
+            for value in [0.0, 1.0, 2048.0, f32::MAX] {
+                for dont_enlarge in [false, true] {
+                    let r = Resize { mode, value, height: 2048, dont_enlarge };
+                    // No uniform scale can keep the short edge >= 1 and long edge <= 65535.
+                    assert_eq!(r.apply(100_000.0, 1.0), (65_535, 1), "{r:?}");
+                    assert_eq!(r.apply(1.0, 100_000.0), (1, 65_535), "{r:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resize_encoder_boundary_preserves_feasible_minimum() {
+        let r = Resize::long_edge(1);
+        for long in [65_534.0, 65_535.0, 65_536.0] {
+            let expected = (long as usize).min(65_535);
+            assert_eq!(r.apply(long, 1.0), (expected, 1));
+            assert_eq!(r.apply(1.0, long), (1, expected));
+        }
+        // Keep the existing minimum-short-edge behavior when uniform scaling is feasible.
+        assert_eq!(r.apply(6000.0, 40.0), (150, 1));
+        assert_eq!(r.apply(40.0, 6000.0), (1, 150));
+        // A source axis above the limit is still scaled uniformly when its aspect ratio fits.
+        let r = Resize { value: 100.0, mode: ResizeMode::Percent, ..Default::default() };
+        assert_eq!(r.apply(100_000.0, 2.0), (65_535, 1));
+        assert_eq!(r.apply(2.0, 100_000.0), (1, 65_535));
+    }
+
+    #[test]
+    fn resized_output_size_handles_extreme_photo_dimensions() {
+        let o = ExportOptions { resize: Some(Resize::default()), ..Default::default() };
+        let mut p = named("wide.png");
+        p.width = 100_000;
+        p.height = 1;
+        assert_eq!(output_size(&p, &o), (65_535, 1));
+        p.width = 1;
+        p.height = 100_000;
+        assert_eq!(output_size(&p, &o), (1, 65_535));
     }
 
     /// A flat field of a saturated green inside Display P3 but outside sRGB, rendered into `space`.
